@@ -15,6 +15,7 @@ export const LEGACY_KEY = 'qepex-work-tracker'; // zustand persist key used up t
 const DB_KEY = 'main';
 
 export interface BootResult {
+  engine: 'sqlite' | 'json'; // json = fallback when WebAssembly is blocked (some sandboxed pages)
   db: DB;
   source: 'sqlite' | 'migrated-v4' | 'seed';
   reports: MigrationReport[];
@@ -22,6 +23,8 @@ export interface BootResult {
 }
 
 let sdb: Database | null = null;
+let jsonMode = false;
+const JSON_KEY = 'json';
 let lastWritten: DB | null = null;
 let persistent = false;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -45,7 +48,11 @@ export async function boot(seed: () => DB, now = new Date().toISOString()): Prom
       persistent = false;
     }
   }
-  sdb = await openDatabase(bytes ?? null);
+  try {
+    sdb = await openDatabase(bytes ?? null);
+  } catch {
+    return bootJson(seed, now);
+  }
 
   let db: DB;
   let source: BootResult['source'];
@@ -67,12 +74,47 @@ export async function boot(seed: () => DB, now = new Date().toISOString()): Prom
   writeState(sdb, db, null);
   lastWritten = db;
   await flush();
-  return { db, source, reports, persistent };
+  return { engine: 'sqlite', db, source, reports, persistent };
+}
+
+/** Fallback: the same data, migrations and IndexedDB, stored as one JSON value instead of SQLite. */
+async function bootJson(seed: () => DB, now: string): Promise<BootResult> {
+  jsonMode = true;
+  sdb = null;
+  let stored: string | undefined;
+  if (persistent) stored = await idbGet<string>(STORE_DB, JSON_KEY).catch(() => undefined);
+  let db: DB;
+  let source: BootResult['source'];
+  let reports: MigrationReport[] = [];
+  if (stored) {
+    db = JSON.parse(stored);
+    source = 'sqlite';
+    if ((db.version ?? 0) < CURRENT_VERSION) ({ db, reports } = runMigrations(db as never, now));
+  } else {
+    const legacy = readLegacy()?.state?.db as ({ version?: number } & Record<string, unknown>) | undefined;
+    if (legacy && typeof legacy.version === 'number' && legacy.version >= 4) {
+      ({ db, reports } = runMigrations(legacy, now));
+      source = 'migrated-v4';
+    } else {
+      db = seed();
+      source = 'seed';
+    }
+  }
+  lastWritten = db;
+  await flush();
+  return { engine: 'json', db, source, reports, persistent };
 }
 
 /** Persist a new state: only changed records are written to SQLite, then the file is saved (debounced). */
 export function save(next: DB) {
-  if (!sdb || next === lastWritten) return;
+  if (next === lastWritten) return;
+  if (jsonMode) {
+    lastWritten = next;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => void flush(), 300);
+    return;
+  }
+  if (!sdb) return;
   writeState(sdb, next, lastWritten);
   lastWritten = next;
   if (saveTimer) clearTimeout(saveTimer);
@@ -80,8 +122,13 @@ export function save(next: DB) {
 }
 
 export async function flush() {
-  if (!sdb || !persistent) return;
+  if (!persistent) return;
   try {
+    if (jsonMode) {
+      if (lastWritten) await idbPut(STORE_DB, JSON_KEY, JSON.stringify(lastWritten));
+      return;
+    }
+    if (!sdb) return;
     await idbPut(STORE_DB, DB_KEY, sdb.export());
   } catch {
     persistent = false;
@@ -90,6 +137,11 @@ export async function flush() {
 
 /** Replace all data (demo reset, backup restore). */
 export function replaceAll(next: DB) {
+  if (jsonMode) {
+    lastWritten = next;
+    void flush();
+    return;
+  }
   if (!sdb) return;
   writeState(sdb, next, null);
   lastWritten = next;
