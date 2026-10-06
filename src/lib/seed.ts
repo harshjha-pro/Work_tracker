@@ -5,6 +5,8 @@ import type {
   AckType,
   Client,
   ComplianceProfile,
+  GstFrequency,
+  GstRegistration,
   DB,
   Engagement,
   ISODate,
@@ -19,14 +21,18 @@ import { applyClientSync, dueForPeriod } from './compliance';
 import { addDays, ayLabel, diffDays, fyKey, fyLabel, fyStartYear, iso, pad, toDate, today, weekStart, weekday } from './dates';
 import { isoAt } from './access';
 import { mulberry32, uid } from './util';
+import { DEFAULT_SETTINGS, GST_STATES } from './migrations/migrate_v4_to_v5.js';
+import { DEMO_DIRECTORS, DEMO_PIN_HASHES, addV5DemoData } from './seedV5';
 
-export const DB_VERSION = 4;
+export const DB_VERSION = 5;
+export const DEMO_TEMP_PIN = '2026';
 
 const BASE_PROFILE: ComplianceProfile = {
-  gstFrequency: 'not_applicable',
-  gstAnnualReturn: false,
-  gst9c: false,
   tds: false,
+  tdsSalary: false,
+  tdsNonSalary: false,
+  tdsNonResident: false,
+  tcs: false,
   advanceTax: false,
   taxAudit: false,
   statutoryAudit: false,
@@ -39,6 +45,23 @@ export function emptyProfile(): ComplianceProfile {
   return { ...BASE_PROFILE };
 }
 
+// Seed client definitions keep a v4-style GST block; it is converted to gstins[] below.
+type SeedProfile = Partial<ComplianceProfile> & { gstFrequency?: GstFrequency | 'not_applicable'; gstAnnualReturn?: boolean; gst9c?: boolean };
+const SEED_BASE: SeedProfile = { ...BASE_PROFILE, gstFrequency: 'not_applicable', gstAnnualReturn: false, gst9c: false };
+
+/** Extra v5 facts per seed client: further GSTINs, TDS/TCS split, transfer pricing. */
+const V5_EXTRA: Record<string, { profile?: Partial<ComplianceProfile>; extraGstins?: { gstin: string; frequency: GstFrequency; iffOpted?: boolean; gstAnnualReturn?: boolean }[]; stateCode?: string }> = {
+  'c-0101': { profile: { tcs: true } }, // TCS on sale of textile scrap (206C(1))
+  'c-0103': { stateCode: '27' },
+  'c-0104': { stateCode: '24' },
+  'c-0107': { stateCode: '27' },
+  'c-0108': {
+    profile: { tdsNonResident: true, transferPricing: true }, // royalty to the US parent; international transactions → Form 3CEB
+    extraGstins: [{ gstin: '27AAGCV2290B1ZA', frequency: 'qrmp', iffOpted: true, gstAnnualReturn: true }], // Pune branch on QRMP
+  },
+  'c-0109': { stateCode: '27' },
+};
+
 export function buildSeed(T: ISODate = today()): DB {
   const rand = mulberry32(20261005);
   const pick = <X,>(xs: X[]) => xs[Math.floor(rand() * xs.length)];
@@ -46,7 +69,7 @@ export function buildSeed(T: ISODate = today()): DB {
   const SYSTEM = 'u-farhan';
   const seedTime = isoAt(addDays(T, -90), '10:00');
 
-  const users: User[] = [
+  const usersV4 = [
     { id: 'u-rajesh', employeeCode: 'QX-P01', name: 'CA Rajesh Iyer', role: 'partner', designation: 'Partner', defaultLocation: 'office', locationOverrideAllowed: true, joiningDate: '2009-04-01' },
     { id: 'u-meera', employeeCode: 'QX-P02', name: 'CA Meera Kulkarni', role: 'partner', designation: 'Partner', defaultLocation: 'office', locationOverrideAllowed: true, joiningDate: '2012-06-01' },
     { id: 'u-priya', employeeCode: 'QX-M11', name: 'Priya Nair', role: 'manager', designation: 'Manager (CA)', defaultLocation: 'office', locationOverrideAllowed: true, joiningDate: '2017-07-10' },
@@ -58,11 +81,40 @@ export function buildSeed(T: ISODate = today()): DB {
     { id: 'u-ananya', employeeCode: 'QX-A32', name: 'Ananya Joshi', role: 'article', designation: 'CS Trainee', defaultLocation: 'office', locationOverrideAllowed: false, joiningDate: '2025-07-01', principalPartnerId: 'u-meera' },
     { id: 'u-aditya', employeeCode: 'QX-A33', name: 'Aditya Kumar', role: 'article', designation: 'CA Article Assistant (new)', defaultLocation: 'office', locationOverrideAllowed: true, joiningDate: addDays(T, -3), principalPartnerId: 'u-rajesh' },
     { id: 'u-farhan', employeeCode: 'QX-AD41', name: 'Farhan Sheikh', role: 'admin', designation: 'Practice Admin', defaultLocation: 'office', locationOverrideAllowed: true, joiningDate: '2018-03-01' },
-  ];
+    // offboarded at the end of articleship — kept so history stays attributed (B1)
+    { id: 'u-nikhil', employeeCode: 'QX-A29', name: 'Nikhil Bhosale', role: 'article', designation: 'CA Article Assistant (completed)', defaultLocation: 'office', locationOverrideAllowed: true, joiningDate: '2023-08-01', principalPartnerId: 'u-meera' },
+  ] as Omit<User, 'active' | 'deactivatedOn' | 'deactivatedBy' | 'deactivationNote' | 'auth'>[];
+  const users: User[] = usersV4.map((u) => {
+    const pin = DEMO_PIN_HASHES[u.id];
+    const offboarded = u.id === 'u-nikhil';
+    return {
+      ...u,
+      email: `${u.name.replace(/^CA /, '').toLowerCase().replace(/[^a-z ]/g, '').trim().replace(/ +/g, '.')}@qepexindia.example`,
+      active: !offboarded,
+      deactivatedOn: offboarded ? addDays(T, -36) : null,
+      deactivatedBy: offboarded ? SYSTEM : null,
+      deactivationNote: offboarded ? 'Articleship completed. Inward register shows one client file still in his custody.' : null,
+      auth: {
+        credentialKind: 'pin',
+        passwordHash: pin && !offboarded ? pin[1] : null,
+        passwordSalt: pin && !offboarded ? pin[0] : null,
+        hashIterations: 210000,
+        mustChangePassword: true,
+        tempPinIssuedAt: pin && !offboarded ? seedTime : null,
+        tempPinIssuedBy: pin && !offboarded ? SYSTEM : null,
+        failedAttempts: 0,
+        lockedUntil: null,
+        lastLoginAt: null,
+        totpSecret: null,
+        totpEnrolledAt: null,
+      },
+    };
+  });
 
   const lastAgmYear = fyStartYear(T); // AGM for the FY just closed falls in Sep of this year
-  type ClientSeed = Omit<Client, 'id' | 'flagHistory' | 'createdAt' | 'createdBy' | 'updatedAt' | 'updatedBy' | 'fyEnd' | 'status' | 'gstins'> & {
+  type ClientSeed = Omit<Client, 'id' | 'flagHistory' | 'createdAt' | 'createdBy' | 'updatedAt' | 'updatedBy' | 'fyEnd' | 'status' | 'gstins' | 'profile' | 'directors' | 'complianceStartDates' | 'statusEffectiveFrom' | 'auditorAppointmentDate'> & {
     id: string;
+    profile: SeedProfile;
     gstins?: string[];
     status?: Client['status'];
     team: [string, 'staff' | 'reviewer'][];
@@ -73,21 +125,21 @@ export function buildSeed(T: ISODate = today()): DB {
       pan: 'AAKCS4821F', tan: 'PNES12345B', gstins: ['27AAKCS4821F1Z5'], cin: 'U17110MH2012PTC234567', udyam: 'UDYAM-MH-26-0012345',
       agmDate: iso(lastAgmYear, 9, 26), booksBy: 'firm', partnerId: 'u-rajesh', managerId: 'u-priya',
       contactName: 'Mahesh Agarwal (Director)', contactPhone: '+91 98220 41567', contactEmail: 'accounts@shreeganeshtex.example',
-      profile: { ...BASE_PROFILE, gstFrequency: 'monthly', gstAnnualReturn: true, gst9c: true, tds: true, advanceTax: true, taxAudit: true, statutoryAudit: true, pf: true, esi: true },
+      profile: { ...SEED_BASE, gstFrequency: 'monthly', gstAnnualReturn: true, gst9c: true, tds: true, advanceTax: true, taxAudit: true, statutoryAudit: true, pf: true, esi: true },
       team: [['u-sneha', 'staff'], ['u-rohit', 'staff']],
     },
     {
       id: 'c-0102', code: 'CL-0102', name: 'Deshmukh & Sons', group: 'Deshmukh Family', constitution: 'partnership_firm',
       pan: 'AAFFD7310K', tan: 'PNED04567C', gstins: ['27AAFFD7310K1ZQ'], booksBy: 'client', partnerId: 'u-rajesh', managerId: 'u-priya',
       contactName: 'Vikas Deshmukh (Partner)', contactPhone: '+91 98500 22314', contactEmail: 'vikas@deshmukhsons.example',
-      profile: { ...BASE_PROFILE, gstFrequency: 'qrmp', gstAnnualReturn: true, tds: true, advanceTax: true, taxAudit: true },
+      profile: { ...SEED_BASE, gstFrequency: 'qrmp', gstAnnualReturn: true, tds: true, advanceTax: true, taxAudit: true },
       team: [['u-karan', 'staff'], ['u-rohit', 'staff']],
     },
     {
       id: 'c-0103', code: 'CL-0103', name: 'Dr. Anil Deshpande', group: 'Deshpande Family', constitution: 'individual',
       pan: 'BXQPD5512M', booksBy: 'client', partnerId: 'u-meera', managerId: 'u-priya',
       contactName: 'Dr. Anil Deshpande', contactPhone: '+91 99230 18842', contactEmail: 'anil.deshpande@clinic.example',
-      profile: { ...BASE_PROFILE, advanceTax: true },
+      profile: { ...SEED_BASE, advanceTax: true },
       team: [['u-divya', 'staff']],
     },
     {
@@ -101,21 +153,21 @@ export function buildSeed(T: ISODate = today()): DB {
       id: 'c-0105', code: 'CL-0105', name: 'Brightpath Logistics LLP', constitution: 'llp',
       pan: 'AAXFB9087P', tan: 'MUMB21345D', gstins: ['27AAXFB9087P1Z2'], cin: 'AAQ-4512', booksBy: 'firm', partnerId: 'u-meera', managerId: 'u-arjun',
       contactName: 'Neha Fernandes (Designated Partner)', contactPhone: '+91 99670 55128', contactEmail: 'finance@brightpath.example',
-      profile: { ...BASE_PROFILE, gstFrequency: 'monthly', gstAnnualReturn: true, tds: true, advanceTax: true, taxAudit: true, pf: true },
+      profile: { ...SEED_BASE, gstFrequency: 'monthly', gstAnnualReturn: true, tds: true, advanceTax: true, taxAudit: true, pf: true },
       team: [['u-karan', 'staff'], ['u-ananya', 'staff']],
     },
     {
       id: 'c-0106', code: 'CL-0106', name: 'Nirmal Foods', group: 'Nirmal Family', constitution: 'proprietorship',
       pan: 'ACNPN4410H', gstins: ['27ACNPN4410H1ZK'], udyam: 'UDYAM-MH-26-0098761', booksBy: 'firm', partnerId: 'u-rajesh', managerId: 'u-priya',
       contactName: 'Suresh Nirmal (Proprietor)', contactPhone: '+91 97640 30019',
-      profile: { ...BASE_PROFILE, gstFrequency: 'composition' },
+      profile: { ...SEED_BASE, gstFrequency: 'composition' },
       team: [['u-rohit', 'staff'], ['u-divya', 'staff']],
     },
     {
       id: 'c-0107', code: 'CL-0107', name: 'Aarohan Education Trust', constitution: 'trust',
       pan: 'AABTA3341R', tan: 'PNEA07788E', booksBy: 'client', partnerId: 'u-meera', managerId: 'u-priya',
       contactName: 'Fr. Joseph Dsouza (Trustee)', contactPhone: '+91 98221 60453', contactEmail: 'office@aarohantrust.example',
-      profile: { ...BASE_PROFILE, tds: true, statutoryAudit: true, pf: true },
+      profile: { ...SEED_BASE, tds: true, statutoryAudit: true, pf: true },
       team: [['u-sneha', 'staff']],
     },
     {
@@ -123,7 +175,7 @@ export function buildSeed(T: ISODate = today()): DB {
       pan: 'AAGCV2290B', tan: 'BLRV09876A', gstins: ['29AAGCV2290B1Z8'], cin: 'U72900KA2019PTC123456',
       agmDate: iso(lastAgmYear, 9, 29), booksBy: 'firm', partnerId: 'u-rajesh', managerId: 'u-arjun',
       contactName: 'Kavya Rao (CFO)', contactPhone: '+91 98450 11276', contactEmail: 'kavya@vistarasoftech.example',
-      profile: { ...BASE_PROFILE, gstFrequency: 'monthly', gstAnnualReturn: true, tds: true, advanceTax: true, statutoryAudit: true, pf: true },
+      profile: { ...SEED_BASE, gstFrequency: 'monthly', gstAnnualReturn: true, tds: true, advanceTax: true, statutoryAudit: true, pf: true },
       team: [['u-sneha', 'staff'], ['u-ananya', 'staff'], ['u-karan', 'staff']],
     },
     {
@@ -138,6 +190,18 @@ export function buildSeed(T: ISODate = today()): DB {
   const db: DB = {
     version: DB_VERSION,
     seededOn: T,
+    meta: { schemaVersion: DB_VERSION, migrationsApplied: [] },
+    settings: { ...DEFAULT_SETTINGS },
+    leaveRequests: [],
+    udinRegister: [],
+    dscRegister: [],
+    dscMovements: [],
+    notices: [],
+    inwardOutward: [],
+    notificationState: [],
+    accessLog: [],
+    attachments: [],
+    importBatches: [],
     users,
     clients: [],
     clientTeam: [],
@@ -152,11 +216,41 @@ export function buildSeed(T: ISODate = today()): DB {
     audit: [],
   };
 
+  const gstReg = (gstin: string, frequency: GstFrequency, annual: boolean, nineC: boolean, iff = false): GstRegistration => ({
+    id: `gst-${gstin}`,
+    gstin,
+    stateCode: gstin.slice(0, 2),
+    state: (GST_STATES as Record<string, string>)[gstin.slice(0, 2)] ?? 'Unknown',
+    frequency,
+    effectiveFrom: '2024-04-01',
+    frequencyHistory: [{ frequency, effectiveFrom: '2024-04-01', changedBy: SYSTEM, changedAt: seedTime }],
+    gstAnnualReturn: annual,
+    gst9c: nineC,
+    iffOpted: iff,
+    status: 'active',
+    cancelledOn: null,
+  });
   for (const s of clientSeeds) {
-    const { team, ...rest } = s;
+    const { team, profile: sp, ...rest } = s;
+    const extra = V5_EXTRA[s.id] ?? {};
+    const { gstFrequency, gstAnnualReturn, gst9c, ...flags } = sp;
+    const profile: ComplianceProfile = { ...BASE_PROFILE, ...flags, ...extra.profile };
+    if (profile.tds) {
+      profile.tdsSalary = true;
+      profile.tdsNonSalary = true;
+    }
+    const gstins = (s.gstins ?? []).map((g) => gstReg(g, gstFrequency === 'not_applicable' || !gstFrequency ? 'not_set' : gstFrequency, !!gstAnnualReturn, !!gst9c));
+    for (const g of extra.extraGstins ?? []) gstins.push(gstReg(g.gstin, g.frequency, !!g.gstAnnualReturn, false, g.iffOpted));
+    const isCompany = s.constitution === 'private_company' || s.constitution === 'public_company';
     db.clients.push({
       ...rest,
-      gstins: s.gstins ?? [],
+      profile,
+      gstins,
+      stateCode: extra.stateCode ?? gstins[0]?.stateCode,
+      directors: DEMO_DIRECTORS[s.id] ?? [],
+      auditorAppointmentDate: isCompany && s.agmDate ? s.agmDate : null,
+      complianceStartDates: {},
+      statusEffectiveFrom: s.status === 'dormant' ? '2025-04-01' : null,
       status: s.status ?? 'active',
       fyEnd: '31 Mar',
       flagHistory: [],
@@ -180,6 +274,8 @@ export function buildSeed(T: ISODate = today()): DB {
     publishedAt: isoAt(addDays(T, -12), '18:30'),
     publishedBy: SYSTEM,
     tasksMoved: 0,
+    status: 'published' as const,
+    supersedesId: null,
   };
   db.extensions.push(tarExt);
 
@@ -196,7 +292,7 @@ export function buildSeed(T: ISODate = today()): DB {
     const n = (len: number) => Array.from({ length: len }, () => between(0, 9)).join('');
     switch (type) {
       case 'arn':
-        return `AA${client.gstins[0]?.slice(0, 2) ?? '27'}${pad(d.getMonth() + 1)}${String(d.getFullYear()).slice(2)}${n(6)}${pick(['K', 'M', 'R', 'T', 'X'])}`;
+        return `AA${client.gstins[0]?.stateCode ?? '27'}${pad(d.getMonth() + 1)}${String(d.getFullYear()).slice(2)}${n(6)}${pick(['K', 'M', 'R', 'T', 'X'])}`;
       case 'challan':
         return `0510308 / ${pad(d.getDate())}${pad(d.getMonth() + 1)}${d.getFullYear()} / ${n(5)}`;
       case 'token':
@@ -306,7 +402,7 @@ export function buildSeed(T: ISODate = today()): DB {
     followUp(ds1, 3, 'u-karan', 'whatsapp', 'Sent reminder with the list of pending documents');
   }
   // Vistara Softech: DIR-3 KYC overdue, director has not completed OTP verification
-  const vk = find('c-0108', 'DIR3', T, 'before');
+  const vk = db.tasks.find((t) => t.clientId === 'c-0108' && t.complianceTypeCode === 'DIR3' && t.directorId === 'dir-vs-1' && t.effectiveDue < T) ?? find('c-0108', 'DIR3', T, 'before');
   if (vk) {
     reset(vk);
     vk.checklist = [
@@ -334,7 +430,13 @@ export function buildSeed(T: ISODate = today()): DB {
   const bp = find('c-0105', 'GSTR1_M', T, 'after');
   if (bp) {
     setStatus(bp, 'in_progress', 3, 'u-karan', addDays(T, -3));
+    // first review round returned with two points, both cleared before resubmission (A13)
+    bp.reviewPoints = [
+      { id: uid(), text: 'B2B invoices to SEZ units are shown as regular supplies — move to SEZ with payment', raisedBy: 'u-arjun', raisedAt: isoAt(addDays(T, -2), '15:10'), clearedBy: 'u-karan', clearedAt: isoAt(addDays(T, -1), '12:30') },
+      { id: uid(), text: 'Credit note CN-118 missing from table 9B', raisedBy: 'u-arjun', raisedAt: isoAt(addDays(T, -2), '15:12'), clearedBy: 'u-karan', clearedAt: isoAt(addDays(T, -1), '12:45') },
+    ];
     setStatus(bp, 'under_review', 3, 'u-karan', addDays(T, -1), 'Submitted for review');
+    bp.review = { submittedBy: 'u-karan', submittedAt: isoAt(addDays(T, -1), '16:40'), checkerId: 'u-arjun', decision: null, decidedAt: null };
     bp.checkerId = 'u-arjun';
     receive(bp, ['Sales register', 'Credit / debit notes', 'E-way bill summary'], 4);
   }
@@ -377,6 +479,10 @@ export function buildSeed(T: ISODate = today()): DB {
     reset(atAudit);
     setStatus(atAudit, 'in_progress', 4, 'u-sneha', addDays(T, -40));
     setStatus(atAudit, 'under_review', 5, 'u-priya', addDays(T, -4), 'Sent for Partner review');
+    atAudit.review = { submittedBy: 'u-priya', submittedAt: isoAt(addDays(T, -4), '12:00'), checkerId: 'u-meera', decision: null, decidedAt: null };
+    atAudit.reviewPoints = [
+      { id: uid(), text: 'Obtain trustee confirmation for corpus donations above ₹1 lakh', raisedBy: 'u-meera', raisedAt: isoAt(addDays(T, -1), '18:05'), clearedBy: null, clearedAt: null },
+    ];
     atAudit.checkerId = 'u-meera';
   }
   // Nirmal Foods: an older CMP-08 that was filed late
@@ -398,8 +504,8 @@ export function buildSeed(T: ISODate = today()): DB {
   }
 
   // ---- One-time engagements ----
-  const oneTime = (e: Omit<Engagement, 'id' | 'createdAt' | 'createdBy' | 'status' | 'type'>, stage: number, status: TaskStatus) => {
-    const eng: Engagement = { ...e, id: uid(), type: 'one_time', status: 'active', createdAt: isoAt(e.startDate!, '10:00'), createdBy: e.managerId ?? SYSTEM };
+  const oneTime = (e: Omit<Engagement, 'id' | 'createdAt' | 'createdBy' | 'status' | 'type' | 'feeBasis'> & { feeBasis?: Engagement['feeBasis'] }, stage: number, status: TaskStatus) => {
+    const eng: Engagement = { feeBasis: null, ...e, id: uid(), type: 'one_time', status: 'active', createdAt: isoAt(e.startDate!, '10:00'), createdBy: e.managerId ?? SYSTEM };
     db.engagements.push(eng);
     const template = tpl(e.templateCode);
     const task: Task = {
@@ -410,6 +516,13 @@ export function buildSeed(T: ISODate = today()): DB {
       periodLabel: e.financialYear ?? '',
       title: e.title,
       templateCode: e.templateCode,
+      templateVersion: template.version,
+      gstinId: null,
+      directorId: null,
+      signoff: null,
+      review: null,
+      reviewPoints: [],
+      supersededByTaskId: null,
       originalDue: e.endDate!,
       effectiveDue: e.endDate!,
       status: 'upcoming',
@@ -436,6 +549,7 @@ export function buildSeed(T: ISODate = today()): DB {
       clientId: 'c-0103', serviceLine: 'direct_tax', title: `Intimation u/s 143(1)(a) — ${ayLabel(fyClosed)}`,
       financialYear: fyLabel(fyClosed), templateCode: 'notice', partnerId: 'u-meera', managerId: 'u-priya',
       team: [{ userId: 'u-divya', role: 'maker' }, { userId: 'u-priya', role: 'checker' }], budgetHours: 6, billable: true,
+      feeBasis: { type: 'fixed', amount: 7500, rate: null, retainerPeriod: null },
       startDate: addDays(T, -10), endDate: addDays(T, 7),
     },
     2,
@@ -451,6 +565,7 @@ export function buildSeed(T: ISODate = today()): DB {
       templateCode: 'bookkeeping', partnerId: 'u-rajesh', managerId: 'u-arjun',
       team: [{ userId: 'u-sneha', role: 'maker' }, { userId: 'u-karan', role: 'maker' }, { userId: 'u-arjun', role: 'checker' }],
       budgetHours: 40, billable: true, startDate: addDays(T, -20), endDate: addDays(T, 10),
+      feeBasis: { type: 'recurring', amount: 18000, rate: null, retainerPeriod: 'quarterly' },
     },
     2,
     'in_progress',
@@ -465,6 +580,7 @@ export function buildSeed(T: ISODate = today()): DB {
       templateCode: 'audit', partnerId: 'u-rajesh', managerId: 'u-priya',
       team: [{ userId: 'u-sneha', role: 'maker' }, { userId: 'u-rohit', role: 'maker' }, { userId: 'u-priya', role: 'checker' }],
       budgetHours: 16, billable: true, startDate: addDays(T, -4), endDate: addDays(T, 21),
+      feeBasis: { type: 'time', amount: null, rate: 2500, retainerPeriod: null },
     },
     0,
     'in_progress',
@@ -574,7 +690,8 @@ export function buildSeed(T: ISODate = today()): DB {
           idx = Math.max(0, Math.min(fi - 1, Math.floor((1 - diffDays(end, d) / 20) * fi)));
         }
         if (isOpen(t.status)) idx = Math.min(idx, t.stageIndex);
-        const room = Math.max(0.5, Math.floor(((t.budgetHours ?? 4) - (taskUsed.get(t.id) ?? 0)) * 4) / 4);
+        const room = Math.floor(((t.budgetHours ?? 4) * 0.9 - (taskUsed.get(t.id) ?? 0)) * 4) / 4;
+        if (room < 0.25) continue;
         const h = Math.min(remaining, room, pick([0.75, 1, 1.5, 2, 2.5, 3]));
         const isAudit = t.templateCode === 'audit';
         const onSite = isAudit && user.role !== 'partner' && rand() < 0.5;
@@ -625,5 +742,7 @@ export function buildSeed(T: ISODate = today()): DB {
     { id: uid(), at: isoAt(addDays(T, -5), '12:00'), by: 'u-karan', entity: 'task', entityId: ds1?.id ?? '', action: 'Marked Pending from Client', detail: 'Deshmukh & Sons · Sales register and credit notes' },
     { id: uid(), at: isoAt(addDays(T, -1), '16:40'), by: 'u-karan', entity: 'task', entityId: bp?.id ?? '', action: 'Submitted for review', detail: 'Brightpath Logistics LLP · GSTR-1' },
   );
+  addV5DemoData(db, T, { notice, stock, books, oneTime, rand });
+  db.audit.sort((a, b) => b.at.localeCompare(a.at));
   return db;
 }

@@ -68,11 +68,13 @@ describe('flags drive the calendar', () => {
     const db = buildSeed(T);
     const c = db.clients.find((x) => x.code === 'CL-0103')!;
     c.profile.tds = true;
+    c.profile.tdsNonSalary = true;
     const plan = planClientSync(db, c);
     expect(plan.create.some((p) => p.type.code === 'TDS_PAY' && p.period.due === '2026-10-07')).toBe(true);
     const r = applyClientSync(db, c.id, 'u-farhan', 'test');
     expect(r.created).toBeGreaterThan(4);
     c.profile.tds = false;
+    c.profile.tdsNonSalary = false;
     const r2 = applyClientSync(db, c.id, 'u-farhan', 'test');
     expect(r2.removed).toBe(r.created);
   });
@@ -80,7 +82,7 @@ describe('flags drive the calendar', () => {
     const db = buildSeed(T);
     const open = db.tasks.filter((t) => t.complianceTypeCode === 'GSTR3B_M' && t.periodKey === '2026-09');
     expect(open.length).toBe(3);
-    const r = applyExtension(db, { id: 'x', complianceTypeCode: 'GSTR3B_M', periodKeys: ['2026-09'], newDueDate: '2026-10-25', reference: 'N', reason: 'r', publishedAt: new Date().toISOString(), publishedBy: 'u-farhan', tasksMoved: 0 });
+    const r = applyExtension(db, { id: 'x', complianceTypeCode: 'GSTR3B_M', periodKeys: ['2026-09'], newDueDate: '2026-10-25', reference: 'N', reason: 'r', publishedAt: new Date().toISOString(), publishedBy: 'u-farhan', tasksMoved: 0, status: 'published', supersedesId: null });
     expect(r.moved).toBe(3);
     for (const t of open) expect(t.effectiveDue).toBe('2026-10-25');
   });

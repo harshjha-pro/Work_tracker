@@ -1,15 +1,27 @@
 # QEPEX India Work Tracker — V1 prototype
 
 A clickable MVP of the V1 spec (CA & CS services), built to test with a few people at QEPEX India.
-Everything runs in the browser: data lives in `localStorage` (one copy per browser), seeded with a
-fictional firm, clients and three weeks of work relative to today's date. No backend, no passwords.
+Everything runs in the browser. Data lives in a SQLite database (WebAssembly, bundled in the app) saved in
+IndexedDB, one copy per browser. It is seeded with a fictional firm, clients and three weeks of work relative
+to today's date. There is no backend.
 
 ```bash
 npm install
 npm run dev            # http://localhost:5173
 npm test               # compliance-engine and seed tests
 npm run build:single   # one self-contained HTML file in dist-single/ to share
+npm run data           # regenerate SCHEMA_V5.md, the validation report and the data/*.sql files
 ```
+
+## Data schema version 5
+
+Version 5 is the frozen data structure for Version 1 of the release plan. Version 2 only adds to it.
+
+- **SCHEMA_V5.md** lists every table and field, its type, whether it's required, the item ID it serves, and an example record. It is generated from `src/lib/storage/schema.ts`, the same definition that creates the SQLite tables.
+- **Migration:** `src/lib/migrations/migrate_v4_to_v5.js` is a pure, idempotent function. On load the app runs the migration chain instead of resetting data (E2). Any v4 data still in `localStorage` is migrated once and left there as a fallback copy.
+- **Data files:** `data/qepex_v5_migrated.sql` is the v4 demo state (`data/qepex_v4_demo_state.json`) migrated to v5, as a SQL dump. `data/qepex_v5_demo_seed.sql` is a fresh v5 seed.
+- **Validation report:** `docs/VALIDATION_REPORT_V5.md` gives counts before and after, every transformation, every judgement call, and Rules Spec scenario coverage.
+- **Tests:** `tests/` covers the migration, SQLite storage, Rules Spec edge cases, and the store guards (review points, filing blocks, audit hook).
 
 ## What's in it (the P0 list)
 

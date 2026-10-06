@@ -15,7 +15,7 @@ export function PeoplePicker({ onPick, currentId }: { onPick: (id: string) => vo
           <div className="eyebrow">{ROLE_LABEL[role]}</div>
           <div className="card flush list">
             {db.users
-              .filter((u) => u.role === role)
+              .filter((u) => u.role === role && u.active)
               .map((u) => {
                 const n = visibleClientIds(db, u).size;
                 return (

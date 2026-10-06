@@ -65,16 +65,41 @@ function activeTab(name: Route['name']): Route['name'] {
 
 export default function App() {
   const init = useApp((s) => s.init);
+  const bootApp = useApp((s) => s.boot);
+  const hydrated = useApp((s) => s.hydrated);
+  const [bootError, setBootError] = useState<string | null>(null);
+
+  useEffect(() => {
+    bootApp()
+      .then(() => init())
+      .catch((e: unknown) => setBootError(e instanceof Error ? e.message : String(e)));
+  }, [bootApp, init]);
+
+  if (!hydrated) return <Booting error={bootError} />;
+  return <Shell />;
+}
+
+function Booting({ error }: { error: string | null }) {
+  return (
+    <div className="login">
+      <div className="login-inner">
+        <div className="brand">
+          <span className="brand-mark">QX</span>
+          <span>QEPEX India · Work Tracker</span>
+        </div>
+        {error ? <div className="form-error">The local database could not be opened: {error}</div> : <p className="muted">Opening your data…</p>}
+      </div>
+    </div>
+  );
+}
+
+function Shell() {
   const me = useMe();
   const route = useApp((s) => s.route);
   const navigate = useApp((s) => s.navigate);
   const sheet = useApp((s) => s.sheet);
   const openSheet = useApp((s) => s.openSheet);
   const [switcher, setSwitcher] = useState(false);
-
-  useEffect(() => {
-    init();
-  }, [init]);
 
   useEffect(() => {
     window.scrollTo(0, 0);

@@ -1,3 +1,4 @@
+import { upgradeComplianceTypes, upgradeTemplates } from './migrations/migrate_v4_to_v5.js';
 import type {
   ComplianceType,
   Constitution,
@@ -84,7 +85,7 @@ export const ACK_LABEL: Record<AckType, string> = {
 };
 
 export const GST_FREQ_LABEL: Record<GstFrequency, string> = {
-  not_applicable: 'Not registered',
+  not_set: 'Not set',
   monthly: 'Monthly',
   qrmp: 'QRMP (quarterly)',
   composition: 'Composition',
@@ -95,11 +96,16 @@ export const FLAG_LABEL: Record<FlagKey, string> = {
   gstRegistered: 'GST registered',
   gstAnnualReturn: 'GSTR-9 annual return',
   gst9c: 'GSTR-9C reconciliation',
-  tds: 'TDS / TCS',
+  iffOpted: 'IFF opted (QRMP)',
+  tds: 'TDS / TCS payment',
+  tdsSalary: 'TDS on salary (24Q)',
+  tdsNonSalary: 'TDS on non-salary (26Q)',
+  tdsNonResident: 'TDS on non-residents (27Q)',
+  tcs: 'TCS (27EQ)',
   advanceTax: 'Advance tax',
   taxAudit: 'Tax audit (44AB)',
   statutoryAudit: 'Statutory audit',
-  transferPricing: 'Transfer pricing',
+  transferPricing: 'Transfer pricing (3CEB)',
   pf: 'PF',
   esi: 'ESI',
   isCompany: 'Company (ROC filings)',
@@ -118,7 +124,8 @@ export const DESCRIPTION_CHIPS = [
   'Drafting reply',
 ];
 
-export const DEFAULT_TEMPLATES: StageTemplate[] = [
+// v4-shaped definitions; upgraded to v5 below by the same code the migration runs.
+const V4_TEMPLATES = [
   {
     code: 'gst_return',
     name: 'GST return',
@@ -214,7 +221,7 @@ const q = (a: [number, number], b: [number, number], c: [number, number], d: [nu
   [a, b, c, d].map(([month, day]) => ({ month, day }));
 
 // Illustrative defaults from spec §6 — to be verified against current law before go-live.
-export const DEFAULT_COMPLIANCE_TYPES: ComplianceType[] = [
+const V4_COMPLIANCE_TYPES = [
   {
     code: 'GSTR1_M', name: 'GSTR-1 (monthly filers)', shortName: 'GSTR-1', serviceLine: 'gst', engagementGroup: 'GST Returns',
     templateCode: 'gst_return', frequency: 'monthly', rule: { kind: 'monthly', day: 11 },
@@ -326,3 +333,16 @@ export const DEFAULT_COMPLIANCE_TYPES: ComplianceType[] = [
     applicability: [{ flag: 'esi', value: 'true' }], defaultBudgetHours: 1, isActive: true,
   },
 ];
+
+export const DEFAULT_TEMPLATES: StageTemplate[] = (() => {
+  const t = structuredClone(V4_TEMPLATES) as unknown as StageTemplate[];
+  upgradeTemplates(t, '2026-04-01T00:00:00.000Z');
+  for (const x of t) for (const v of x.versions) v.createdBy = 'system';
+  return t;
+})();
+
+export const DEFAULT_COMPLIANCE_TYPES: ComplianceType[] = (() => {
+  const t = structuredClone(V4_COMPLIANCE_TYPES) as unknown as ComplianceType[];
+  upgradeComplianceTypes(t);
+  return t;
+})();

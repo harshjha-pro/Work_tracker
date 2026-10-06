@@ -41,6 +41,7 @@ export function EngagementForm({ id, clientId }: { id?: string; clientId?: strin
           team: db.clientTeam.filter((a) => a.clientId === first?.id).map((a) => ({ userId: a.userId, role: a.role === 'reviewer' ? 'checker' : 'maker' }) as EngagementMember),
           budgetHours: 10,
           billable: true,
+          feeBasis: null,
           startDate: today(),
           endDate: addDays(today(), 30),
         },
@@ -66,7 +67,7 @@ export function EngagementForm({ id, clientId }: { id?: string; clientId?: strin
       team: db.clientTeam.filter((a) => a.clientId === cid).map((a) => ({ userId: a.userId, role: a.role === 'reviewer' ? 'checker' : 'maker' })),
     }));
   };
-  const pool = db.users.filter((u) => u.role === 'staff' || u.role === 'article' || u.role === 'manager');
+  const pool = db.users.filter((u) => u.active && (u.role === 'staff' || u.role === 'article' || u.role === 'manager'));
   const setMember = (userId: string, role: EngagementMember['role'] | null) =>
     setF((x) => ({ ...x, team: role ? [...x.team.filter((m) => m.userId !== userId), { userId, role }] : x.team.filter((m) => m.userId !== userId) }));
 
@@ -128,6 +129,37 @@ export function EngagementForm({ id, clientId }: { id?: string; clientId?: strin
             <span className="label">Billable</span>
             <Seg value={f.billable ? 'y' : 'n'} onChange={(v) => set('billable', v === 'y')} options={[{ value: 'y', label: 'Chargeable' }, { value: 'n', label: 'Non-chargeable' }]} />
             <span className="hint">Set by the Partner. Never shown to Staff or Article Assistants.</span>
+          </div>
+        )}
+        {can.seeBilling(me.role) && (
+          <div className="field">
+            <span className="label">Fee basis</span>
+            <Seg<string>
+              value={f.feeBasis?.type ?? 'none'}
+              onChange={(v) => set('feeBasis', v === 'none' ? null : { type: v as 'fixed' | 'recurring' | 'time', amount: v === 'time' ? null : f.feeBasis?.amount ?? null, rate: v === 'time' ? f.feeBasis?.rate ?? null : null, retainerPeriod: v === 'recurring' ? f.feeBasis?.retainerPeriod ?? 'monthly' : null })}
+              options={[{ value: 'none', label: 'Not set' }, { value: 'fixed', label: 'Fixed' }, { value: 'recurring', label: 'Retainer' }, { value: 'time', label: 'Time-based' }]}
+            />
+            {f.feeBasis && f.feeBasis.type !== 'time' && (
+              <div className="grid-2">
+                <Field label={f.feeBasis.type === 'fixed' ? 'Fee (₹, excl. GST)' : 'Retainer per period (₹, excl. GST)'} htmlFor="e-fee">
+                  <input id="e-fee" className="input" type="number" min={0} step={100} value={f.feeBasis.amount ?? ''} onChange={(e) => set('feeBasis', { ...f.feeBasis!, amount: e.target.value ? Number(e.target.value) : null })} />
+                </Field>
+                {f.feeBasis.type === 'recurring' && (
+                  <Field label="Period" htmlFor="e-period">
+                    <select id="e-period" className="input" value={f.feeBasis.retainerPeriod ?? 'monthly'} onChange={(e) => set('feeBasis', { ...f.feeBasis!, retainerPeriod: e.target.value as 'monthly' | 'quarterly' | 'annual' })}>
+                      <option value="monthly">Monthly</option>
+                      <option value="quarterly">Quarterly</option>
+                      <option value="annual">Annual</option>
+                    </select>
+                  </Field>
+                )}
+              </div>
+            )}
+            {f.feeBasis?.type === 'time' && (
+              <Field label="Rate (₹ per hour)" htmlFor="e-rate">
+                <input id="e-rate" className="input" type="number" min={0} step={50} value={f.feeBasis.rate ?? ''} onChange={(e) => set('feeBasis', { ...f.feeBasis!, rate: e.target.value ? Number(e.target.value) : null })} />
+              </Field>
+            )}
           </div>
         )}
       </section>

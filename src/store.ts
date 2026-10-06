@@ -1,6 +1,5 @@
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
-import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware';
 import type {
   AckType,
   ChecklistStatus,
@@ -17,7 +16,10 @@ import type {
   User,
   WorkEntry,
 } from './lib/types';
-import { buildSeed, DB_VERSION } from './lib/seed';
+import { buildSeed } from './lib/seed';
+import { DEMO_FILES } from './lib/seedV5';
+import { boot as bootStorage, putFile, replaceAll, save as saveToStorage, type BootResult } from './lib/storage/persist';
+import type { MigrationReport } from './lib/migrations';
 import { applyClientSync, applyExtension, derivedFlags, recomputeDues } from './lib/compliance';
 import { CONSTITUTION_LABEL, FLAG_LABEL, GST_FREQ_LABEL, isOpen, ROLE_LABEL, STATUS_LABEL } from './lib/master';
 import { addDays, fmtDate, nowIso, today } from './lib/dates';
@@ -81,6 +83,9 @@ interface AppState {
   sheet: EntrySheetState | null;
   toast: { id: number; text: string } | null;
 
+  hydrated: boolean;
+  storageInfo: { source: BootResult['source']; persistent: boolean; reports: MigrationReport[] } | null;
+  boot: () => Promise<void>;
   init: () => void;
   login: (userId: string) => void;
   logout: () => void;
@@ -99,9 +104,13 @@ interface AppState {
   markPending: (taskId: string, what: string, items: string[]) => void;
   resumeFromPending: (taskId: string) => void;
   submitForReview: (taskId: string, checkerId: string) => Result;
-  reviewDecision: (taskId: string, approve: boolean, note: string) => void;
+  reviewDecision: (taskId: string, approve: boolean, note: string) => Result;
+  raiseReviewPoint: (taskId: string, text: string) => void;
+  clearReviewPoint: (taskId: string, pointId: string) => void;
+  setChecklistNote: (taskId: string, itemId: string, note: string) => void;
+  requestAllChecklist: (taskId: string) => void;
   recordFiling: (taskId: string, ackType: AckType, number: string, date: ISODate) => Result;
-  markNotApplicable: (taskId: string, reason: string) => void;
+  markNotApplicable: (taskId: string, reason: string) => Result;
   reopenTask: (taskId: string) => void;
   assignTask: (taskId: string, userId: string) => void;
   addChecklistItem: (taskId: string, name: string) => void;
@@ -116,44 +125,88 @@ interface AppState {
   updateComplianceType: (code: string, patch: Partial<ComplianceType>) => { moved: number; created: number; removed: number };
   addComplianceType: (t: ComplianceType) => { created: number };
   publishExtension: (x: ExtensionInput) => { moved: number; clients: number; reclassified: number };
-  updateTemplate: (code: string, patch: { stages?: string[]; checklist?: string[]; name?: string }) => void;
+  updateTemplate: (code: string, patch: { stages?: string[]; checklist?: string[]; name?: string }, opts?: { moveOpenTasks?: boolean; stageMap?: number[]; note?: string }) => void;
 
   setLockSettings: (dayOffset: number, time: string) => void;
   extendLock: (weekStart: ISODate, userId: string | null, until: string, reason: string) => void;
+
+  // E5 — every new collection goes through these, so every change is audited
+  saveRecord: <K extends RecordCollection>(collection: K, record: DB[K][number]) => Result;
+  deleteRecord: (collection: RecordCollection, id: string, reason?: string) => Result;
+  logAccess: (entity: DB['accessLog'][number]['entity'], entityId: string | null, action: DB['accessLog'][number]['action'], detail: string) => void;
 }
 
-const STORAGE_KEY = 'qepex-work-tracker';
+export type RecordCollection =
+  | 'users'
+  | 'leaveRequests'
+  | 'udinRegister'
+  | 'dscRegister'
+  | 'dscMovements'
+  | 'notices'
+  | 'inwardOutward'
+  | 'notificationState'
+  | 'attachments'
+  | 'importBatches';
 
-// localStorage can be unavailable (private mode, sandboxed frames) — fall back to memory.
-const memory = new Map<string, string>();
-const safeStorage: StateStorage = {
-  getItem: (k) => {
-    try {
-      return localStorage.getItem(k) ?? memory.get(k) ?? null;
-    } catch {
-      return memory.get(k) ?? null;
-    }
-  },
-  setItem: (k, v) => {
-    memory.set(k, v);
-    try {
-      localStorage.setItem(k, v);
-    } catch {
-      /* memory only */
-    }
-  },
-  removeItem: (k) => {
-    memory.delete(k);
-    try {
-      localStorage.removeItem(k);
-    } catch {
-      /* ignore */
-    }
-  },
+const COLLECTION_ENTITY: Record<RecordCollection, DB['audit'][number]['entity']> = {
+  users: 'user',
+  leaveRequests: 'leave',
+  udinRegister: 'udin',
+  dscRegister: 'dsc',
+  dscMovements: 'dsc',
+  notices: 'notice',
+  inwardOutward: 'inward_outward',
+  notificationState: 'notification',
+  attachments: 'attachment',
+  importBatches: 'import',
 };
+const APPEND_ONLY: RecordCollection[] = ['dscMovements'];
 
-function audit(db: DB, by: string, entity: DB['audit'][number]['entity'], entityId: string, action: string, detail?: string) {
-  db.audit.unshift({ id: uid(), at: nowIso(), by, entity, entityId, action, detail });
+/** Field-level differences for the audit trail (E5). Credentials are never written to the log. */
+export function diffFields(before: object | undefined, after: object): { field: string; from: string; to: string }[] {
+  const out: { field: string; from: string; to: string }[] = [];
+  const b = (before ?? {}) as Record<string, unknown>;
+  const a = after as Record<string, unknown>;
+  for (const k of new Set([...Object.keys(b), ...Object.keys(a)])) {
+    if (k === 'auth') {
+      if (JSON.stringify(b[k]) !== JSON.stringify(a[k])) out.push({ field: 'auth', from: '(credentials)', to: '(credentials changed)' });
+      continue;
+    }
+    const x = JSON.stringify(b[k] ?? null);
+    const y = JSON.stringify(a[k] ?? null);
+    if (x !== y) out.push({ field: k, from: x.length > 120 ? `${x.slice(0, 117)}…` : x, to: y.length > 120 ? `${y.slice(0, 117)}…` : y });
+  }
+  return out;
+}
+
+let bootOnce: Promise<BootResult> | null = null;
+
+const SESSION_KEY = 'qepex-session';
+function readSession(): string | null {
+  try {
+    return localStorage.getItem(SESSION_KEY);
+  } catch {
+    return null;
+  }
+}
+function writeSession(id: string | null) {
+  try {
+    if (id) localStorage.setItem(SESSION_KEY, id);
+    else localStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* session only */
+  }
+}
+
+async function writeDemoFiles(db: DB) {
+  for (const a of db.attachments) {
+    const make = DEMO_FILES[a.blobKey];
+    if (make) await putFile(a.blobKey, make()).catch(() => undefined);
+  }
+}
+
+function audit(db: DB, by: string, entity: DB['audit'][number]['entity'], entityId: string, action: string, detail?: string, changes?: DB['audit'][number]['changes']) {
+  db.audit.unshift({ id: uid(), at: nowIso(), by, entity, entityId, action, detail, ...(changes?.length ? { changes } : {}) });
   if (db.audit.length > 800) db.audit.length = 800;
 }
 
@@ -203,30 +256,43 @@ function profileDiff(before: Client | undefined, after: Pick<Client, 'constituti
 }
 
 export const useApp = create<AppState>()(
-  persist(
     immer((set, get) => {
       const me = () => get().currentUserId ?? 'system';
       return {
-        db: buildSeed(),
+        // replaced by boot() before anything renders
+        db: null as unknown as DB,
+        hydrated: false,
+        storageInfo: null,
         currentUserId: null,
         route: { name: 'home' },
         history: [],
         sheet: null,
         toast: null,
 
+        boot: async () => {
+          // React StrictMode runs effects twice in development; boot only once
+          bootOnce ??= bootStorage(() => buildSeed());
+          const r = await bootOnce;
+          if (get().hydrated) return;
+          if (r.source === 'seed') await writeDemoFiles(r.db);
+          const session = readSession();
+          set((s) => {
+            s.db = r.db;
+            s.hydrated = true;
+            s.storageInfo = { source: r.source, persistent: r.persistent, reports: r.reports };
+            s.currentUserId = session && r.db.users.some((u) => u.id === session && u.active) ? session : null;
+          });
+        },
+
         init: () =>
           set((s) => {
-            if (s.db.version !== DB_VERSION) {
-              s.db = buildSeed();
-              s.currentUserId = null;
-              return;
-            }
             // Nightly-job equivalent: extend every active client's calendar to the horizon
             for (const c of s.db.clients) if (c.status === 'active') applyClientSync(s.db, c.id, 'u-farhan', 'Applicability changed', today());
           }),
 
         login: (userId) =>
           set((s) => {
+            writeSession(userId);
             s.currentUserId = userId;
             s.route = { name: 'home' };
             s.history = [];
@@ -234,6 +300,7 @@ export const useApp = create<AppState>()(
           }),
         logout: () =>
           set((s) => {
+            writeSession(null);
             s.currentUserId = null;
             s.sheet = null;
           }),
@@ -259,14 +326,18 @@ export const useApp = create<AppState>()(
           set((s) => {
             s.sheet = null;
           }),
-        resetDemo: () =>
+        resetDemo: () => {
+          const fresh = buildSeed();
+          replaceAll(fresh);
+          void writeDemoFiles(fresh);
           set((s) => {
-            s.db = buildSeed();
+            s.db = fresh;
             s.route = { name: 'home' };
             s.history = [];
             s.sheet = null;
             s.toast = { id: Date.now(), text: 'Demo data reset' };
-          }),
+          });
+        },
 
         saveEntry: (input, entryId) => {
           const st = get();
@@ -402,6 +473,7 @@ export const useApp = create<AppState>()(
           set((s) => {
             const task = s.db.tasks.find((t) => t.id === taskId)!;
             task.checkerId = checkerId;
+            task.review = { submittedBy: me(), submittedAt: nowIso(), checkerId, decision: null, decidedAt: null };
             changeStatus(task, 'under_review', me(), `Submitted to ${actorLabel(s.db, checkerId)}`);
             audit(s.db, me(), 'task', taskId, 'Submitted for review', taskLabel(s.db, task));
             s.toast = { id: Date.now(), text: 'Submitted for review' };
@@ -409,19 +481,72 @@ export const useApp = create<AppState>()(
           return { ok: true };
         },
 
-        reviewDecision: (taskId, approve, note) =>
+        reviewDecision: (taskId, approve, note) => {
+          const task0 = get().db.tasks.find((t) => t.id === taskId);
+          if (!task0) return { ok: false, error: 'Task not found.' };
+          const maker = task0.review?.submittedBy ?? task0.assignedTo;
+          if (maker === me()) return { ok: false, error: 'You cannot be both maker and checker on the same task.' };
+          if (get().db.users.find((u) => u.id === me())?.role === 'article') return { ok: false, error: 'Article assistants are always makers, never checkers.' };
+          if (approve && task0.reviewPoints.some((p) => !p.clearedAt)) return { ok: false, error: 'Clear the open review points before approving.' };
+          if (!approve && !note.trim()) return { ok: false, error: 'Add at least one review point.' };
           set((s) => {
             const task = s.db.tasks.find((t) => t.id === taskId)!;
             const tpl = s.db.templates.find((x) => x.code === task.templateCode)!;
+            const now = nowIso();
             if (approve && task.stageIndex < (tpl.filingStageIndex ?? tpl.stages.length) - 1) task.stageIndex += 1;
+            if (!approve)
+              for (const line of note.split('\n').map((x) => x.trim()).filter(Boolean))
+                task.reviewPoints.push({ id: uid(), text: line, raisedBy: me(), raisedAt: now, clearedBy: null, clearedAt: null });
+            task.review = { ...(task.review ?? { submittedBy: maker ?? me(), submittedAt: now, checkerId: me() }), checkerId: me(), decision: approve ? 'approved' : 'returned', decidedAt: now };
             changeStatus(task, 'in_progress', me(), approve ? `Review approved${note ? ` — ${note}` : ''}` : `Returned with review points: ${note}`);
             audit(s.db, me(), 'task', taskId, approve ? 'Review approved' : 'Returned to maker', `${taskLabel(s.db, task)}${note ? ` · ${note}` : ''}`);
             s.toast = { id: Date.now(), text: approve ? 'Approved' : 'Returned to maker' };
+          });
+          return { ok: true };
+        },
+
+        raiseReviewPoint: (taskId, text) =>
+          set((s) => {
+            const task = s.db.tasks.find((t) => t.id === taskId)!;
+            task.reviewPoints.push({ id: uid(), text, raisedBy: me(), raisedAt: nowIso(), clearedBy: null, clearedAt: null });
+            audit(s.db, me(), 'task', taskId, 'Review point raised', `${taskLabel(s.db, task)} · ${text}`);
+          }),
+
+        clearReviewPoint: (taskId, pointId) =>
+          set((s) => {
+            const task = s.db.tasks.find((t) => t.id === taskId)!;
+            const p = task.reviewPoints.find((x) => x.id === pointId)!;
+            p.clearedBy = me();
+            p.clearedAt = nowIso();
+            audit(s.db, me(), 'task', taskId, 'Review point cleared', `${taskLabel(s.db, task)} · ${p.text}`);
+          }),
+
+        setChecklistNote: (taskId, itemId, note) =>
+          set((s) => {
+            const task = s.db.tasks.find((t) => t.id === taskId)!;
+            const item = task.checklist.find((c) => c.id === itemId)!;
+            item.note = note || undefined;
+            audit(s.db, me(), 'task', taskId, 'Checklist note', `${item.name}: ${note}`);
+          }),
+
+        requestAllChecklist: (taskId) =>
+          set((s) => {
+            const task = s.db.tasks.find((t) => t.id === taskId)!;
+            let n = 0;
+            for (const c of task.checklist)
+              if (c.status === 'not_requested') {
+                c.status = 'requested';
+                c.dateRequested = today();
+                n++;
+              }
+            audit(s.db, me(), 'task', taskId, 'Checklist: all requested', `${taskLabel(s.db, task)} · ${n} item(s)`);
           }),
 
         recordFiling: (taskId, ackType, number, date) => {
           if (!number.trim()) return { ok: false, error: 'Enter the acknowledgment number — a task closes only once it is recorded.' };
           if (date > today()) return { ok: false, error: 'Filing date cannot be in the future.' };
+          const blocked = filingBlock(get().db, taskId);
+          if (blocked) return { ok: false, error: blocked };
           let status: TaskStatus = 'filed';
           set((s) => {
             const task = s.db.tasks.find((t) => t.id === taskId)!;
@@ -430,13 +555,19 @@ export const useApp = create<AppState>()(
           return { ok: true, message: status === 'filed' ? 'Filed on time' : 'Recorded as Filed Late' };
         },
 
-        markNotApplicable: (taskId, reason) =>
+        markNotApplicable: (taskId, reason) => {
+          const t0 = get().db.tasks.find((t) => t.id === taskId);
+          if (!t0) return { ok: false, error: 'Task not found.' };
+          if (t0.status === 'filed' || t0.status === 'filed_late') return { ok: false, error: 'A filed task cannot be marked Not Applicable.' };
+          if (!reason.trim()) return { ok: false, error: 'Give a reason.' };
           set((s) => {
             const task = s.db.tasks.find((t) => t.id === taskId)!;
             task.naReason = reason;
             changeStatus(task, 'not_applicable', me(), reason);
             audit(s.db, me(), 'task', taskId, 'Marked Not Applicable', `${taskLabel(s.db, task)} · ${reason}`);
-          }),
+          });
+          return { ok: true };
+        },
 
         reopenTask: (taskId) =>
           set((s) => {
@@ -568,6 +699,13 @@ export const useApp = create<AppState>()(
                   periodLabel: eng.financialYear ?? '',
                   title: eng.title,
                   templateCode: eng.templateCode,
+                  templateVersion: tpl.version,
+                  gstinId: null,
+                  directorId: null,
+                  signoff: null,
+                  review: null,
+                  reviewPoints: [],
+                  supersededByTaskId: null,
                   originalDue: due,
                   effectiveDue: due,
                   status: 'upcoming',
@@ -647,7 +785,11 @@ export const useApp = create<AppState>()(
         publishExtension: (x) => {
           let out = { moved: 0, clients: 0, reclassified: 0 };
           set((s) => {
-            const ext = { ...x, id: uid(), publishedAt: nowIso(), publishedBy: me(), tasksMoved: 0 };
+            const ext = { ...x, supersedesId: x.supersedesId ?? null, status: 'published' as const, id: uid(), publishedAt: nowIso(), publishedBy: me(), tasksMoved: 0 };
+            if (ext.supersedesId) {
+              const old = s.db.extensions.find((e) => e.id === ext.supersedesId);
+              if (old) old.status = 'superseded';
+            }
             out = applyExtension(s.db, ext);
             ext.tasksMoved = out.moved;
             s.db.extensions.push(ext);
@@ -657,13 +799,27 @@ export const useApp = create<AppState>()(
           return out;
         },
 
-        updateTemplate: (code, patch) =>
+        // A27 — a new version applies to new tasks; open tasks move only when asked, with a stage mapping
+        updateTemplate: (code, patch, opts) =>
           set((s) => {
             const t = s.db.templates.find((x) => x.code === code)!;
             Object.assign(t, patch);
             if (t.filingStageIndex !== null && t.filingStageIndex >= t.stages.length) t.filingStageIndex = t.stages.length - 1;
-            for (const task of s.db.tasks) if (task.templateCode === code) task.stageIndex = Math.min(task.stageIndex, t.stages.length - 1);
-            audit(s.db, me(), 'template', code, 'Stage template updated', t.name);
+            t.version += 1;
+            t.versions.push({
+              version: t.version, name: t.name, stages: [...t.stages], checklist: [...t.checklist], filingStageIndex: t.filingStageIndex,
+              ackType: t.ackType, reviewLevel: t.reviewLevel, effectiveFrom: nowIso(), createdBy: me(), note: opts?.note ?? '',
+            });
+            let moved = 0;
+            if (opts?.moveOpenTasks)
+              for (const task of s.db.tasks) {
+                if (task.templateCode !== code || !isOpen(task.status)) continue;
+                const mapped = opts.stageMap?.[task.stageIndex];
+                task.stageIndex = Math.min(mapped ?? task.stageIndex, t.stages.length - 1);
+                task.templateVersion = t.version;
+                moved++;
+              }
+            audit(s.db, me(), 'template', code, `Stage template updated to version ${t.version}`, `${t.name}${moved ? ` · ${moved} open task(s) moved` : ' · open tasks stay on their version'}`);
           }),
 
         setLockSettings: (dayOffset, time) =>
@@ -677,17 +833,61 @@ export const useApp = create<AppState>()(
             s.db.lockExtensions.push({ id: uid(), weekStart, userId, until, reason, by: me(), at: nowIso() });
             audit(s.db, me(), 'lock', weekStart, 'Weekly lock extended', `Week of ${fmtDate(weekStart)} for ${userId ? actorLabel(s.db, userId) : 'everyone'} until ${new Date(until).toLocaleString('en-IN')} · ${reason}`);
           }),
+
+        saveRecord: (collection, record) => {
+          const list = get().db[collection] as { id: string }[];
+          const id = (record as { id: string }).id;
+          if (!id) return { ok: false, error: 'Record needs an id.' };
+          const before = list.find((r) => r.id === id);
+          if (before && APPEND_ONLY.includes(collection)) return { ok: false, error: 'This register is append-only.' };
+          const changes = diffFields(before, record);
+          if (before && !changes.length) return { ok: true };
+          set((s) => {
+            const arr = s.db[collection] as { id: string }[];
+            const i = arr.findIndex((r) => r.id === id);
+            if (i >= 0) arr[i] = record as never;
+            else arr.push(record as never);
+            audit(s.db, me(), COLLECTION_ENTITY[collection], id, before ? `${collection} record updated` : `${collection} record added`, undefined, changes);
+          });
+          return { ok: true };
+        },
+
+        deleteRecord: (collection, id, reason) => {
+          if (APPEND_ONLY.includes(collection)) return { ok: false, error: 'This register is append-only.' };
+          if (collection === 'users') return { ok: false, error: 'Users are deactivated, never deleted.' };
+          const before = (get().db[collection] as { id: string }[]).find((r) => r.id === id);
+          if (!before) return { ok: false, error: 'Record not found.' };
+          set((s) => {
+            (s.db as unknown as Record<string, { id: string }[]>)[collection] = (s.db[collection] as { id: string }[]).filter((r) => r.id !== id);
+            audit(s.db, me(), COLLECTION_ENTITY[collection], id, `${collection} record deleted`, reason, diffFields(before, {}));
+          });
+          return { ok: true };
+        },
+
+        logAccess: (entity, entityId, action, detail) =>
+          set((s) => {
+            s.db.accessLog.push({ id: uid(), at: nowIso(), userId: me(), entity, entityId, action, detail });
+          }),
       };
     }),
-    {
-      name: STORAGE_KEY,
-      storage: createJSONStorage(() => safeStorage),
-      partialize: (s) => ({ db: s.db, currentUserId: s.currentUserId }) as Partial<AppState>,
-      version: DB_VERSION,
-      migrate: () => ({ db: buildSeed(), currentUserId: null }) as Partial<AppState>,
-    },
-  ),
 );
+
+// Every change to the data is written to SQLite (changed records only).
+useApp.subscribe((s, prev) => {
+  if (s.hydrated && prev.hydrated && s.db !== prev.db) saveToStorage(s.db);
+});
+
+/** A14 — filing is blocked while review points are open, the task is with the checker, or a required sign-off is missing. */
+export function filingBlock(db: DB, taskId: string): string | null {
+  const task = db.tasks.find((t) => t.id === taskId);
+  if (!task) return 'Task not found.';
+  const open = task.reviewPoints.filter((p) => !p.clearedAt).length;
+  if (open) return `${open} review point${open === 1 ? ' is' : 's are'} still open.`;
+  if (task.status === 'under_review') return 'The task is with the checker — filing opens once the review is approved.';
+  const tpl = db.templates.find((t) => t.code === task.templateCode);
+  if (tpl?.requiresSignoff && task.review?.decision !== 'approved') return `${tpl.reviewLevel} approval is needed before filing.`;
+  return null;
+}
 
 function fileInto(db: DB, task: Task, ackType: AckType, number: string, date: ISODate, by: string): TaskStatus {
   const tpl = db.templates.find((x) => x.code === task.templateCode)!;
@@ -695,6 +895,19 @@ function fileInto(db: DB, task: Task, ackType: AckType, number: string, date: IS
   if (tpl.filingStageIndex !== null) task.stageIndex = Math.max(task.stageIndex, tpl.filingStageIndex);
   else task.stageIndex = tpl.stages.length - 1;
   const status: TaskStatus = date <= task.effectiveDue ? 'filed' : 'filed_late';
+  if (tpl.requiresSignoff) {
+    let udinId: string | null = null;
+    if (ackType === 'udin') {
+      const client = db.clients.find((c) => c.id === task.clientId)!;
+      udinId = uid();
+      db.udinRegister.push({
+        id: udinId, clientId: task.clientId, taskId: task.id, engagementId: task.engagementId, institute: 'icai', documentType: task.title.split(' · ')[0],
+        dateOfSigning: date, signingPartnerId: task.review?.checkerId ?? client.partnerId, udin: number, dateGenerated: date, signedCopyRef: null,
+        status: 'generated', reconciledAt: null, reconciledBy: null, notes: '', createdAt: nowIso(), createdBy: by,
+      });
+    }
+    task.signoff = { by: task.review?.checkerId ?? by, at: nowIso(), udinId };
+  }
   changeStatus(task, status, by, `${ackType.toUpperCase()} ${number}`);
   audit(db, by, 'task', task.id, STATUS_LABEL[status], `${taskLabel(db, task)} · ${ackType.toUpperCase()} ${number}`);
   return status;

@@ -9,8 +9,14 @@ import { Empty, Icon, PageHead, Pill } from '../components/ui';
 export function flagSummary(c: Client): string[] {
   const f = derivedFlags(c);
   const out: string[] = [];
-  if (c.profile.gstFrequency !== 'not_applicable') out.push(`GST ${GST_FREQ_LABEL[c.profile.gstFrequency].replace(' (quarterly)', '')}`);
+  const gst = c.gstins.filter((g) => g.status === 'active');
+  if (gst.length) {
+    const freqs = [...new Set(gst.map((g) => GST_FREQ_LABEL[g.frequency].replace(' (quarterly)', '')))];
+    out.push(`GST ${freqs.join(' + ')}${gst.length > 1 ? ` (${gst.length} GSTINs)` : ''}`);
+  }
   if (c.profile.tds) out.push('TDS');
+  if (c.profile.tcs) out.push('TCS');
+  if (c.profile.transferPricing) out.push('TP');
   if (c.profile.taxAudit) out.push('Tax audit');
   if (c.profile.statutoryAudit) out.push('Stat audit');
   if (f.isCompany === 'true') out.push('ROC');
